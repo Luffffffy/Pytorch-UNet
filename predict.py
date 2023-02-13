@@ -18,30 +18,19 @@ def predict_img(net,
                 scale_factor=1,
                 out_threshold=0.5):
     net.eval()
-    img = torch.from_numpy(BasicDataset.preprocess(full_img, scale_factor, is_mask=False))
+    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, scale_factor, is_mask=False))
     img = img.unsqueeze(0)
     img = img.to(device=device, dtype=torch.float32)
 
     with torch.no_grad():
-        output = net(img)
-
+        output = net(img).cpu()
+        output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
         if net.n_classes > 1:
-            probs = F.softmax(output, dim=1)[0]
+            mask = output.argmax(dim=1)
         else:
-            probs = torch.sigmoid(output)[0]
+            mask = torch.sigmoid(output) > out_threshold
 
-        tf = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((full_img.size[1], full_img.size[0])),
-            transforms.ToTensor()
-        ])
-
-        full_mask = tf(probs.cpu()).squeeze()
-
-    if net.n_classes == 1:
-        return (full_mask > out_threshold).numpy()
-    else:
-        return F.one_hot(full_mask.argmax(dim=0), net.n_classes).permute(2, 0, 1).numpy()
+    return mask[0].long().squeeze().numpy()
 
 
 def get_args():
@@ -58,7 +47,8 @@ def get_args():
     parser.add_argument('--scale', '-s', type=float, default=0.5,
                         help='Scale factor for the input images')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-
+    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    
     return parser.parse_args()
 
 
@@ -69,31 +59,45 @@ def get_output_filenames(args):
     return args.output or list(map(_generate_name, args.input))
 
 
-def mask_to_image(mask: np.ndarray):
-    if mask.ndim == 2:
-        return Image.fromarray((mask * 255).astype(np.uint8))
-    elif mask.ndim == 3:
-        return Image.fromarray((np.argmax(mask, axis=0) * 255 / mask.shape[0]).astype(np.uint8))
+def mask_to_image(mask: np.ndarray, mask_values):
+    if isinstance(mask_values[0], list):
+        out = np.zeros((mask.shape[-2], mask.shape[-1], len(mask_values[0])), dtype=np.uint8)
+    elif mask_values == [0, 1]:
+        out = np.zeros((mask.shape[-2], mask.shape[-1]), dtype=bool)
+    else:
+        out = np.zeros((mask.shape[-2], mask.shape[-1]), dtype=np.uint8)
+
+    if mask.ndim == 3:
+        mask = np.argmax(mask, axis=0)
+
+    for i, v in enumerate(mask_values):
+        out[mask == i] = v
+
+    return Image.fromarray(out)
 
 
 if __name__ == '__main__':
     args = get_args()
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
     in_files = args.input
     out_files = get_output_filenames(args)
 
-    net = UNet(n_channels=3, n_classes=2, bilinear=args.bilinear)
+    net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Loading model {args.model}')
     logging.info(f'Using device {device}')
 
     net.to(device=device)
-    net.load_state_dict(torch.load(args.model, map_location=device))
+    state_dict = torch.load(args.model, map_location=device)
+    mask_values = state_dict.pop('mask_values', [0, 1])
+    net.load_state_dict(state_dict)
 
     logging.info('Model loaded!')
 
     for i, filename in enumerate(in_files):
-        logging.info(f'\nPredicting image {filename} ...')
+        logging.info(f'Predicting image {filename} ...')
         img = Image.open(filename)
 
         mask = predict_img(net=net,
@@ -104,7 +108,7 @@ if __name__ == '__main__':
 
         if not args.no_save:
             out_filename = out_files[i]
-            result = mask_to_image(mask)
+            result = mask_to_image(mask, mask_values)
             result.save(out_filename)
             logging.info(f'Mask saved to {out_filename}')
 
